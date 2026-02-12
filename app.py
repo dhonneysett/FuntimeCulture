@@ -27,9 +27,11 @@ import time
 from typing import Dict, List, Tuple, Any
 
 import os
+import io
 import uuid
 import hashlib
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timezone, timedelta
 
 import numpy as np
 import pandas as pd
@@ -40,12 +42,18 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 
-import streamlit as st
 from supabase import create_client
 
 # ✅ Put this near the top (after imports)
 @st.cache_resource
 def get_supabase():
+    """Create a Supabase client if secrets are configured.
+
+    NOTE: The Supabase *service role* key must only ever live in Streamlit Secrets
+    (server-side). Never commit it to GitHub.
+    """
+    if "SUPABASE_URL" not in st.secrets or "SUPABASE_SERVICE_KEY" not in st.secrets:
+        return None
     return create_client(
         st.secrets["SUPABASE_URL"],
         st.secrets["SUPABASE_SERVICE_KEY"],
@@ -53,7 +61,111 @@ def get_supabase():
 
 sb = get_supabase()
 
+def supabase_available() -> bool:
+    return sb is not None
 
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def make_token() -> str:
+    return secrets.token_urlsafe(32)
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def parse_dt(val: str) -> datetime:
+    """Parse ISO timestamps returned by Supabase."""
+    # Supabase typically returns ISO strings with timezone info.
+    try:
+        dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.now(timezone.utc)
+
+def require_admin() -> None:
+    """Very simple Vervio gate (MVP)."""
+    if "ADMIN_PASSWORD" not in st.secrets:
+        st.error("ADMIN_PASSWORD is not set in Streamlit Secrets.")
+        st.stop()
+
+    if "admin_ok" not in st.session_state:
+        st.session_state.admin_ok = False
+
+    if not st.session_state.admin_ok:
+        st.title("Vervio Dashboard Login")
+        pw = st.text_input("Password", type="password")
+        if st.button("Unlock"):
+            st.session_state.admin_ok = (pw == st.secrets["ADMIN_PASSWORD"])
+        if not st.session_state.admin_ok:
+            st.stop()
+
+def sb_get_invite_by_token(token: str) -> Dict[str, Any] | None:
+    if not supabase_available():
+        return None
+    th = hash_token(token)
+    res = sb.table("invites").select("*").eq("token_hash", th).limit(1).execute()
+    data = getattr(res, "data", None) or []
+    return data[0] if data else None
+
+def sb_mark_invite_started(invite_id: int) -> None:
+    if not supabase_available():
+        return
+    try:
+        sb.table("invites").update({"status": "started"}).eq("id", invite_id).execute()
+    except Exception:
+        pass
+
+def sb_mark_invite_completed(invite_id: int) -> None:
+    if not supabase_available():
+        return
+    try:
+        sb.table("invites").update({"status": "completed", "completed_at": _now_utc_iso()}).eq("id", invite_id).execute()
+    except Exception:
+        pass
+
+def sb_expire_invite(invite_id: int) -> None:
+    if not supabase_available():
+        return
+    try:
+        sb.table("invites").update({"status": "expired"}).eq("id", invite_id).execute()
+    except Exception:
+        pass
+
+def sb_create_invite(role: str, candidate_email: str | None, expires_days: int = 7) -> Dict[str, Any]:
+    """Create an invite record and return {token, link, invite_id}."""
+    if not supabase_available():
+        raise RuntimeError("Supabase is not configured.")
+    if "APP_BASE_URL" not in st.secrets:
+        raise RuntimeError("APP_BASE_URL is not set in Streamlit Secrets.")
+
+    token = make_token()
+    th = hash_token(token)
+    expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_days))).isoformat()
+
+    payload = {
+        "candidate_email": candidate_email or None,
+        "role": role,
+        "token_hash": th,
+        "status": "invited",
+        "expires_at": expires_at,
+    }
+    out = sb.table("invites").insert(payload).execute()
+    invite_row = (getattr(out, "data", None) or [None])[0]
+    invite_id = invite_row["id"] if invite_row and "id" in invite_row else None
+
+    link = f'{st.secrets["APP_BASE_URL"]}/?token={token}'
+    return {"token": token, "token_hash": th, "link": link, "invite_id": invite_id}
+
+def sb_store_result(invite_id: int, scores_json: Dict[str, Any], report_json: Dict[str, Any]) -> None:
+    if not supabase_available():
+        return
+    sb.table("results").insert({
+        "invite_id": invite_id,
+        "scores_json": scores_json,
+        "report_json": report_json,
+    }).execute()
 APP_TITLE = "BEA • Behavioural & Emotional Alignment Assessment (Prototype)"
 VERSION = "0.2.0"
 
@@ -714,9 +826,9 @@ ATTENTION_CHECK_ITEMS = [
 ]
 INFREQUENCY_ITEMS = ["IF01", "IF02", "IF03"]
 INFREQUENCY_ITEM_TEXT = [
-    ("IF01", "I have never made a mistake at work — not even once.",),
-    ("IF02", "I have never felt stressed or frustrated at work.",),
-    ("IF03", "I always get along with everyone, all the time.",),
+    ("IF01", "I have never made a mistake at work — not even once."),
+    ("IF02", "I have never felt stressed or frustrated at work."),
+    ("IF03", "I always get along with everyone, all the time."),
 ]
 
 # Inconsistency pairs (similar items phrased differently)
@@ -1457,7 +1569,7 @@ def page_org_setup():
     }
     st.download_button("Download profile JSON", data=json.dumps(profile, indent=2).encode("utf-8"), file_name="bea_profile.json", mime="application/json")
 
-def page_assessment():
+def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = None):
     st.header("Candidate Assessment")
     st.write("Complete modules. You can run fewer modules for development use, or include all for a richer profile.")
 
@@ -1471,17 +1583,26 @@ def page_assessment():
         st.warning("Please tick the consent checkbox to proceed.")
         st.stop()
 
-    candidate_name = st.text_input("Candidate / staff member name (for report)", value="")
-    role_name = st.text_input("Role / position being assessed", value="")
-    store_for_stats = st.checkbox(
-        "Store this assessment (pseudonymised) to build reliability/accuracy statistics over time",
-        value=True,
-    )
-    store_identifiable = st.checkbox(
-        "Include candidate/staff name in stored log (only if you have consent)",
-        value=False,
-    )
-    candidate_id = st.text_input("Internal candidate/staff ID (optional, for test–retest tracking)", value="")
+    # In token mode (candidate link), role is fixed to the invite.
+    if token_mode and invite:
+        candidate_name = st.text_input("Your name (optional — helps the examiner interpret the report)", value="")
+        role_name = st.text_input("Role / position", value=str(invite.get("role", "")), disabled=True)
+        # For token mode we avoid local file logging; results are stored to Supabase (server-side).
+        store_for_stats = False
+        store_identifiable = False
+        candidate_id = ""
+    else:
+        candidate_name = st.text_input("Candidate / staff member name (for report)", value="")
+        role_name = st.text_input("Role / position being assessed", value="")
+        store_for_stats = st.checkbox(
+            "Store this assessment (pseudonymised) to build reliability/accuracy statistics over time",
+            value=True,
+        )
+        store_identifiable = st.checkbox(
+            "Include candidate/staff name in stored log (only if you have consent)",
+            value=False,
+        )
+        candidate_id = st.text_input("Internal candidate/staff ID (optional, for test–retest tracking)", value="")
 
 
     start = st.session_state.get("start_time", None)
@@ -1703,6 +1824,32 @@ def page_assessment():
             append_assessment_log(record)
 
         st.session_state["latest_results"] = results
+
+        # If this assessment was completed via a token link, store results in Supabase and close the loop.
+        if token_mode and invite:
+            if not supabase_available():
+                st.error("Supabase is not configured on this deployment, so results cannot be submitted.")
+                st.stop()
+
+            invite_id = int(invite.get("id"))
+            # Minimal 'headline' scores for quick dashboard viewing
+            scores_json = {
+                "behavioural_alignment": float(results.get("behavioral", {}).get("overall", float("nan"))) if "behavioral" in results else None,
+                "values_congruence": float(results.get("values", {}).get("fit_0_100", float("nan"))) if "values" in results else None,
+                "ei_sjt": float(results.get("ei", {}).get("overall", float("nan"))) if "ei" in results else None,
+            }
+
+            report_json = {k: v for k, v in results.items() if not k.startswith("_")}
+
+            try:
+                sb_store_result(invite_id, scores_json=scores_json, report_json=report_json)
+                sb_mark_invite_completed(invite_id)
+                st.success("Submitted successfully. Thank you — you can close this tab.")
+                st.stop()
+            except Exception as e:
+                st.error(f"Could not submit results: {e}")
+                st.stop()
+
         st.success("Results generated. Go to 'Results & Report' in the sidebar to view and export.")
 
 def page_results():
@@ -1865,6 +2012,69 @@ def page_results():
     except Exception as e:
         st.error(f"PDF export failed: {e}")
 
+
+def page_vervio_dashboard():
+    st.header("Vervio Dashboard (Invites & Results)")
+    st.caption("MVP flow: generate token link → send to candidate → results return here.")
+
+    if not supabase_available():
+        st.error("Supabase is not configured. Add SUPABASE_URL and SUPABASE_SERVICE_KEY in Streamlit Secrets.")
+        st.stop()
+
+    require_admin()
+
+    st.subheader("Create invite link")
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        role = st.text_input("Role", value="Candidate Role")
+    with col2:
+        email = st.text_input("Candidate email (optional)", value="")
+    with col3:
+        expires_days = st.number_input("Expires (days)", min_value=1, max_value=30, value=7)
+
+    if st.button("Generate token link"):
+        try:
+            out = sb_create_invite(role=role.strip() or "Candidate Role", candidate_email=email.strip() or None, expires_days=int(expires_days))
+            st.success("Invite created. Copy & email this link:")
+            st.code(out["link"])
+        except Exception as e:
+            st.error(str(e))
+
+    st.divider()
+    st.subheader("Invites")
+    inv = sb.table("invites").select("*").order("created_at", desc=True).limit(250).execute().data
+
+    if not inv:
+        st.info("No invites yet.")
+        return
+
+    for row in inv:
+        cols = st.columns([2, 2, 1, 2])
+        cols[0].write(row.get("candidate_email") or "—")
+        cols[1].write(row.get("role") or "—")
+        cols[2].write(row.get("status") or "—")
+        cols[3].write(row.get("created_at") or "—")
+
+        if row.get("status") == "completed":
+            res = sb.table("results").select("*").eq("invite_id", row["id"]).order("created_at", desc=True).limit(1).execute().data
+            if res:
+                report = res[0].get("report_json") or {}
+                scores = res[0].get("scores_json") or {}
+
+                with st.expander(f"View result (Invite #{row['id']})"):
+                    st.markdown("**Headline scores**")
+                    st.json(scores)
+
+                    st.markdown("**Report summary (stored)**")
+                    st.json({k: report.get(k) for k in ["candidate_name","role","date","behavioral","values","ei","personality","leadership","type_lens","management_prefs","conflict_style","quality"] if k in report})
+
+                    try:
+                        pdf_bytes = make_pdf_report(report, report.get("candidate_name",""), report.get("role",""), notes="")
+                        st.download_button("Download PDF summary report", data=pdf_bytes, file_name=f"bea_report_invite_{row['id']}.pdf", mime="application/pdf")
+                    except Exception as e:
+                        st.error(f"PDF export failed: {e}")
+
+
 def page_psychometrics():
     st.title("Psychometrics & Validation Workspace")
 
@@ -1943,10 +2153,10 @@ Generalizability Theory (G-Theory), as well as Messick’s unified validity evid
     st.caption("CTT reminder: Observed score = True score + Error. Reliability helps estimate the Standard Error of Measurement (SEM).")
 
     big5_ids = [i for i, _, _, _ in BIG5_ITEMS]
-    big5_sign = {i: sign for i, _, _, sign in BIG5_ITEMS}
+    big5_rev = {i: rev for i, _, _, rev in BIG5_ITEMS}
     def big5_scorer(iid, raw):
         raw = int(raw)
-        return 6 - raw if big5_sign.get(iid, 1) < 0 else raw
+        return 6 - raw if big5_rev.get(iid, False) else raw
 
     type_ids = [i for i, _, _, _ in TYPE_ITEMS]
     type_rev = {i: rev for i, _, _, rev in TYPE_ITEMS}
@@ -1960,9 +2170,13 @@ Generalizability Theory (G-Theory), as well as Messick’s unified validity evid
         raw = int(raw)
         return 6 - raw if mp_rev.get(iid, False) else raw
 
-    ei_ids = list(EI_SJT_ITEMS.keys())
+    ei_ids = [it['id'] for it in EI_SJT]
+    ei_map = {it['id']: it for it in EI_SJT}
     def ei_item_score(iid, choice):
-        return float(EI_SJT_ITEMS[iid]["credit"].get(choice, 0.0))
+        item = ei_map.get(iid)
+        if not item:
+            return 0.0
+        return float(item['weights'].get(choice, 0.0))
 
     lead_ids = [i for i, _, _, _ in LEADERSHIP_ITEMS]
     lead_rev = {i: rev for i, _, _, rev in LEADERSHIP_ITEMS}
@@ -2119,8 +2333,45 @@ def page_research_notes():
         "and consult qualified professionals."
     )
 
+def page_candidate_token(token: str):
+    st.title(APP_TITLE)
+
+    if not supabase_available():
+        st.error("This deployment is not configured to accept token-based assessments.")
+        st.stop()
+
+    invite = sb_get_invite_by_token(token)
+    if not invite:
+        st.error("Invalid link (token not found).")
+        st.stop()
+
+    # Expiry check
+    exp_raw = invite.get("expires_at")
+    if exp_raw:
+        exp = parse_dt(str(exp_raw))
+        if datetime.now(timezone.utc) > exp:
+            sb_expire_invite(int(invite.get("id")))
+            st.error("This link has expired.")
+            st.stop()
+
+    status = (invite.get("status") or "").lower()
+    if status == "completed":
+        st.info("This assessment link has already been completed.")
+        st.stop()
+    if status == "invited":
+        sb_mark_invite_started(int(invite.get("id")))
+
+    # Run the normal assessment page in token mode (no sidebar navigation)
+    page_assessment(token_mode=True, invite=invite)
+
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
+
+    token = st.query_params.get("token")
+    if token:
+        page_candidate_token(str(token))
+        return
+
     st.sidebar.title("Navigation")
     pages = {
         "Home": page_home,
@@ -2128,6 +2379,7 @@ def main():
         "Candidate Assessment": page_assessment,
         "Results & Report": page_results,
         "Psychometrics & Validation": page_psychometrics,
+        "Vervio Dashboard": page_vervio_dashboard,
         "Research notes": page_research_notes,
     }
     choice = st.sidebar.radio("Go to", list(pages.keys()))
