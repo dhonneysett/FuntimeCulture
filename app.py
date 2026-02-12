@@ -40,6 +40,19 @@ from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 from reportlab.lib.units import mm
 
+import streamlit as st
+from supabase import create_client
+
+# ✅ Put this near the top (after imports)
+@st.cache_resource
+def get_supabase():
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_SERVICE_KEY"],
+    )
+
+sb = get_supabase()
+
 
 APP_TITLE = "BEA • Behavioural & Emotional Alignment Assessment (Prototype)"
 VERSION = "0.2.0"
