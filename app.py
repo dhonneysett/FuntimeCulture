@@ -1541,31 +1541,68 @@ def management_recommendations(behavior_table: pd.DataFrame) -> List[str]:
     return recs
 
 def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: str = "") -> bytes:
-    """Generate a *comprehensive* PDF report that mirrors the Streamlit Results view.
+    """Generate a polished PDF report that mirrors the Streamlit dashboard as closely as possible.
 
-    Works with:
-      - In-session results dict (may include DataFrames under keys like '_behavior_table')
-      - Stored Supabase report_json (may include 'tables' with list-of-dict records)
+    - Uses colour + clean tables for readability.
+    - If detailed tables are available (either via underscore keys in-session, or result["tables"] from Supabase),
+      they are included in the PDF.
     """
-    import io
-    import math
-    import json
-    from datetime import datetime
-    from xml.sax.saxutils import escape
-
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import mm
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib import colors
     from reportlab.platypus import (
         SimpleDocTemplate,
         Paragraph,
         Spacer,
-        PageBreak,
         Table,
         TableStyle,
-        LongTable,
+        PageBreak,
+        KeepTogether,
     )
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib import colors as rl_colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+
+    def _safe_text(x: Any, fallback: str = "—") -> str:
+        if x is None:
+            return fallback
+        try:
+            s = str(x).strip()
+        except Exception:
+            return fallback
+        return s if s else fallback
+
+    def _fmt_pct(x: Any) -> str:
+        try:
+            if x is None:
+                return "—"
+            if isinstance(x, str):
+                x = float(x)
+            if isinstance(x, (int, float)) and (math.isnan(x) if isinstance(x, float) else False):
+                return "—"
+            return f"{float(x):.1f}"
+        except Exception:
+            return "—"
+
+    def _band_from_val(v: Any) -> str:
+        try:
+            if v is None:
+                return "-"
+            f = float(v)
+            if math.isnan(f):
+                return "-"
+            return band(f)
+        except Exception:
+            return "-"
+
+    # --- brand-ish palette (warm + readable)
+    COL_CHARCOAL = HexColor("#1f1f1f")
+    COL_COPPER   = HexColor("#B36A4C")
+    COL_GOLD     = HexColor("#D7B56D")
+    COL_SAND     = HexColor("#E8D9C6")
+    COL_SAGE     = HexColor("#6F8F7B")
+    COL_LIGHT    = HexColor("#F7F4F0")
+    COL_GRID     = HexColor("#DDDDDD")
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -1575,445 +1612,380 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
         rightMargin=18 * mm,
         topMargin=16 * mm,
         bottomMargin=16 * mm,
-        title="BEA Assessment Report",
-        author="Vervio (BEA Prototype)",
+        title="BEA Report",
+        author="Vervio",
     )
 
     styles = getSampleStyleSheet()
-    title_style = styles["Title"]
-    h1 = styles["Heading1"]
-    h2 = styles["Heading2"]
-    body = styles["BodyText"]
+    styles.add(ParagraphStyle(name="TitleBig", parent=styles["Title"], fontName="Helvetica-Bold",
+                              fontSize=20, leading=24, textColor=rl_colors.white, alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="TitleSub", parent=styles["Normal"], fontName="Helvetica",
+                              fontSize=10, leading=13, textColor=rl_colors.white, alignment=TA_LEFT))
+    styles.add(ParagraphStyle(name="H1", parent=styles["Heading1"], fontName="Helvetica-Bold",
+                              fontSize=13, leading=16, textColor=COL_CHARCOAL, spaceAfter=6))
+    styles.add(ParagraphStyle(name="H2", parent=styles["Heading2"], fontName="Helvetica-Bold",
+                              fontSize=11, leading=14, textColor=COL_CHARCOAL, spaceBefore=8, spaceAfter=4))
+    styles.add(ParagraphStyle(name="Body", parent=styles["Normal"], fontName="Helvetica",
+                              fontSize=9.5, leading=12, textColor=COL_CHARCOAL))
+    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontName="Helvetica",
+                              fontSize=8.2, leading=10.5, textColor=COL_CHARCOAL))
+    styles.add(ParagraphStyle(name="Bullet", parent=styles["Normal"], fontName="Helvetica",
+                              fontSize=9.2, leading=12, leftIndent=12, bulletIndent=6,
+                              textColor=COL_CHARCOAL))
 
-    # Tighter body style for dense sections
-    body_small = ParagraphStyle(
-        "BodySmall",
-        parent=body,
-        fontSize=9.5,
-        leading=12,
-        spaceAfter=4,
+    story: List[Any] = []
+
+    # ---- header banner
+    org = _safe_text(result.get("org") or (result.get("config_json") or {}).get("org_name") or (result.get("context") or {}).get("org"))
+    generated = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    header_tbl = Table(
+        [[
+            Paragraph("BEA Assessment Report", styles["TitleBig"]),
+        ]],
+        colWidths=[doc.width],
     )
-
-    def fmt(x, nd=1):
-        if x is None:
-            return "—"
-        try:
-            if isinstance(x, str):
-                return x
-            if isinstance(x, (int, float)):
-                if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-                    return "—"
-                return f"{x:.{nd}f}"
-        except Exception:
-            pass
-        return str(x)
-
-    def get_tables_dict() -> dict:
-        t = result.get("tables")
-        return t if isinstance(t, dict) else {}
-
-    def df_from_records(records):
-        try:
-            import pandas as pd
-            if records and isinstance(records, list):
-                return pd.DataFrame(records)
-        except Exception:
-            pass
-        return None
-
-    def get_table(df_key: str, table_key: str):
-        # Prefer in-session DataFrame
-        t = result.get(df_key)
-        try:
-            import pandas as pd
-            if isinstance(t, pd.DataFrame):
-                return t.copy()
-        except Exception:
-            pass
-        # Else use stored records
-        tables = get_tables_dict()
-        recs = tables.get(table_key)
-        if isinstance(recs, list):
-            return df_from_records(recs)
-        return None
-
-    def add_kv_table(pairs):
-        data = [[Paragraph(f"<b>{escape(str(k))}</b>", body_small), Paragraph(escape(str(v)), body_small)] for k, v in pairs]
-        tbl = Table(data, colWidths=[45*mm, 120*mm])
-        tbl.setStyle(TableStyle([
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LINEBELOW", (0,0), (-1,-1), 0.25, colors.grey),
-            ("LEFTPADDING", (0,0), (-1,-1), 2),
-            ("RIGHTPADDING", (0,0), (-1,-1), 2),
-            ("TOPPADDING", (0,0), (-1,-1), 1),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 4),
-        ]))
-        return tbl
-
-    def add_table_from_df(df, columns, header_labels=None, max_rows=None):
-        if df is None or len(df) == 0:
-            return None
-        if max_rows is not None:
-            df = df.head(int(max_rows))
-        cols = columns
-        headers = header_labels or cols
-        table_data = [list(headers)]
-        for _, r in df.iterrows():
-            row = []
-            for c in cols:
-                v = r.get(c, "")
-                if isinstance(v, float):
-                    row.append(fmt(v, 1))
-                else:
-                    row.append(str(v))
-            table_data.append(row)
-
-        tbl = LongTable(table_data, repeatRows=1)
-        tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
-            ("TEXTCOLOR", (0,0), (-1,0), colors.black),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("FONTSIZE", (0,0), (-1,0), 9),
-            ("FONTSIZE", (0,1), (-1,-1), 8.7),
-            ("LINEBELOW", (0,0), (-1,0), 0.6, colors.black),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.lightgrey),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("LEFTPADDING", (0,0), (-1,-1), 2),
-            ("RIGHTPADDING", (0,0), (-1,-1), 2),
-            ("TOPPADDING", (0,0), (-1,-1), 2),
-            ("BOTTOMPADDING", (0,0), (-1,-1), 2),
-        ]))
-        return tbl
-
-    def bullets(lines):
-        out = []
-        for ln in (lines or []):
-            s = str(ln).strip()
-            if not s:
-                continue
-            out.append(Paragraph(f"• {escape(s)}", body_small))
-        return out
-
-    story = []
-
-    story.append(Paragraph("BEA • Behavioural & Emotional Alignment — Report", title_style))
-    story.append(Spacer(1, 3*mm))
-    story.append(Paragraph(f"Version: {escape(str(VERSION))}", body_small))
-    story.append(Spacer(1, 2*mm))
-
-    # Metadata
-    story.append(Paragraph("Assessment details", h2))
-    story.append(add_kv_table([
-        ("Candidate/Staff", candidate or result.get("candidate_name") or "—"),
-        ("Role", role or result.get("role") or "—"),
-        ("Date", result.get("date") or datetime.now().strftime("%Y-%m-%d")),
-        ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("Organisation (invite)", (result.get("org") or (result.get("config_json") or {}).get("org_name") or "—")),
+    header_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), COL_COPPER),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 12),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
     ]))
-    story.append(Spacer(1, 4*mm))
+    story.append(header_tbl)
 
-    # Executive summary
-    story.append(Paragraph("Executive summary", h2))
-    beh = result.get("behavioral", {})
-    val = result.get("values", {})
-    ei = result.get("ei", {})
+    header_tbl2 = Table(
+        [[Paragraph(f"Organisation: <b>{org}</b>  •  Generated: <b>{generated}</b>  •  Version: <b>{VERSION}</b>", styles["TitleSub"])]],
+        colWidths=[doc.width],
+    )
+    header_tbl2.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), COL_CHARCOAL),
+        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(header_tbl2)
+    story.append(Spacer(1, 10))
 
-    summary_pairs = []
-    if isinstance(beh, dict) and "overall" in beh:
-        summary_pairs.append(("Behavioural alignment", f"{fmt(beh.get('overall'))}/100 ({beh.get('band','—')})"))
-    if isinstance(val, dict) and "fit_0_100" in val:
-        summary_pairs.append(("Values congruence", f"{fmt(val.get('fit_0_100'))}/100 ({val.get('band','—')})"))
-    if isinstance(ei, dict) and "overall" in ei:
-        summary_pairs.append(("EI SJT", f"{fmt(ei.get('overall'))}/100 ({ei.get('band','—')})"))
+    # ---- metadata card
+    meta = [
+        [Paragraph("<b>Candidate / Staff</b>", styles["Small"]), Paragraph(_safe_text(candidate), styles["Small"]),
+         Paragraph("<b>Role</b>", styles["Small"]), Paragraph(_safe_text(role), styles["Small"])],
+        [Paragraph("<b>Date (assessment)</b>", styles["Small"]), Paragraph(_safe_text(result.get("date")), styles["Small"]),
+         Paragraph("<b>Reference</b>", styles["Small"]), Paragraph(_safe_text(result.get("reference") or result.get("invite_id") or ""), styles["Small"])],
+    ]
+    meta_tbl = Table(meta, colWidths=[30*mm, 60*mm, 20*mm, doc.width - (30+60+20)*mm])
+    meta_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), COL_LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.6, COL_GRID),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, COL_GRID),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    story.append(meta_tbl)
+    story.append(Spacer(1, 10))
 
-    if summary_pairs:
-        story.append(add_kv_table(summary_pairs))
-    else:
-        story.append(Paragraph("No headline scores were found in this report payload.", body_small))
-    story.append(Spacer(1, 3*mm))
+    # ---- headline scores
+    beh = result.get("behavioral", {}) or {}
+    val = result.get("values", {}) or {}
+    ei  = result.get("ei", {}) or {}
 
-    # Response quality
-    q = result.get("quality", {}) if isinstance(result.get("quality", {}), dict) else {}
-    story.append(Paragraph("Response quality flags (interpretation cautions)", h2))
-    q_lines = []
-    if q:
-        q_lines.append(f"Completion time: {fmt(q.get('duration_sec'), 0)} seconds")
-        warnings = q.get("warnings") or []
-        if warnings:
-            q_lines.append("Flags triggered:")
-            q_lines.extend([f"- {w}" for w in warnings])
-        else:
-            q_lines.append("No warning flags triggered.")
-    else:
-        q_lines.append("No quality data available.")
-    story.extend(bullets(q_lines))
-    story.append(PageBreak())
+    beh_score = beh.get("overall")
+    val_score = val.get("fit_0_100")
+    ei_score  = ei.get("overall")
 
-    # Behavioural alignment details
-    if isinstance(beh, dict) and ("overall" in beh or result.get("_behavior_table") is not None or get_tables_dict().get("behavior_table")):
-        story.append(Paragraph("Behavioural alignment", h1))
-        if "overall" in beh:
-            story.append(Paragraph(f"Overall: <b>{escape(fmt(beh.get('overall')))}</b>/100 ({escape(str(beh.get('band','—')))})", body_small))
-            story.append(Paragraph(f"Core behaviours: {escape(fmt(beh.get('core')))} • Differentiators: {escape(fmt(beh.get('differentiators')))}", body_small))
-        # Strengths / watch-outs
-        if beh.get("top_strengths"):
-            story.append(Paragraph("Top strengths (highest behaviours)", h2))
-            story.extend(bullets([f"{r.get('behavior','—')} ({fmt(r.get('score_0_100'),0)})" for r in beh.get("top_strengths", [])]))
-        if beh.get("watchouts"):
-            story.append(Paragraph("Watch-outs (lowest behaviours)", h2))
-            story.extend(bullets([f"{r.get('behavior','—')} ({fmt(r.get('score_0_100'),0)})" for r in beh.get("watchouts", [])]))
+    score_data = [[
+        Paragraph("<b>Behavioural alignment</b>", styles["Small"]),
+        Paragraph(f"<b>{_fmt_pct(beh_score)}</b>/100<br/><font color='#{COL_SAGE.hexval()[2:]}'>{_safe_text(beh.get('band') or _band_from_val(beh_score))}</font>", styles["Small"]),
+        Paragraph("<b>Values congruence</b>", styles["Small"]),
+        Paragraph(f"<b>{_fmt_pct(val_score)}</b>/100<br/><font color='#{COL_SAGE.hexval()[2:]}'>{_safe_text(val.get('band') or _band_from_val(val_score))}</font>", styles["Small"]),
+        Paragraph("<b>EI (SJT)</b>", styles["Small"]),
+        Paragraph(f"<b>{_fmt_pct(ei_score)}</b>/100<br/><font color='#{COL_SAGE.hexval()[2:]}'>{_safe_text(ei.get('band') or _band_from_val(ei_score))}</font>", styles["Small"]),
+    ]]
+    score_tbl = Table(score_data, colWidths=[35*mm, 25*mm, 28*mm, 25*mm, 18*mm, doc.width - (35+25+28+25+18)*mm])
+    score_tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), COL_SAND),
+        ("BOX", (0, 0), (-1, -1), 0.6, COL_GRID),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, COL_GRID),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(score_tbl)
+    story.append(Spacer(1, 12))
 
-        # Pull the behavioural table once (works both in-session and in stored reports)
-        dfb = get_table("_behavior_table", "behavior_table")
-
-        # Suggested management focus (based on the lowest behaviours)
-        try:
-            if dfb is not None and len(dfb) > 0 and "behavior" in dfb.columns and "score_0_100" in dfb.columns:
-                story.append(Paragraph("Suggested management focus (based on lowest behaviours)", h2))
-                low = dfb.dropna(subset=["score_0_100"]).sort_values("score_0_100", ascending=True).head(4)
-                any_tip = False
-                for _, row in low.iterrows():
-                    name = str(row.get("behavior", "")).strip()
-                    tips = BEHAVIOR_COACHING_TIPS.get(name, [])
-                    if tips:
-                        any_tip = True
-                        story.append(Paragraph(f"• {escape(name)}: {escape(str(tips[0]))}", body_small))
-                if not any_tip:
-                    story.append(Paragraph("• Use the watch-out behaviours as coaching priorities: define 1–2 target behaviours and review weekly.", body_small))
-        except Exception:
-            pass
-
-        # Full table if available
-        if dfb is not None and len(dfb) > 0:
+    # ---- helper: extract DataFrame tables
+    def _df_from(key_underscore: str, key_tables: str) -> pd.DataFrame | None:
+        # in-session
+        if key_underscore in result and isinstance(result[key_underscore], pd.DataFrame):
+            return result[key_underscore].copy()
+        # from Supabase JSON
+        tables = result.get("tables") or {}
+        if isinstance(tables, dict) and key_tables in tables and isinstance(tables[key_tables], list):
             try:
-                dfb = dfb.copy()
-                # band column
-                def _band(x):
+                return pd.DataFrame(tables[key_tables])
+            except Exception:
+                return None
+        return None
+
+    def _add_section(title: str):
+        bar = Table([[Paragraph(title, ParagraphStyle("SecTitle", parent=styles["Body"], fontName="Helvetica-Bold",
+                                                    fontSize=10.5, textColor=rl_colors.white))]],
+                    colWidths=[doc.width])
+        bar.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), COL_CHARCOAL),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(Spacer(1, 6))
+        story.append(bar)
+        story.append(Spacer(1, 6))
+
+    def _bullet_list(items: List[str]):
+        for it in items:
+            story.append(Paragraph(f"• {it}", styles["Body"]))
+
+    def _table_from_df(df: pd.DataFrame, columns: List[Tuple[str, str]], col_widths: List[float], number_cols: set[str] | None = None):
+        number_cols = number_cols or set()
+        data = []
+        header = [Paragraph(f"<b>{title}</b>", styles["Small"]) for _, title in columns]
+        data.append(header)
+        for _, row in df.iterrows():
+            out_row = []
+            for col, _title in columns:
+                v = row.get(col, "")
+                if col in number_cols:
                     try:
-                        x = float(x)
+                        if v is None or (isinstance(v, float) and math.isnan(v)):
+                            s = "—"
+                        else:
+                            s = f"{float(v):.1f}"
                     except Exception:
-                        return "—"
-                    return "High" if x >= 75 else ("Moderate" if x >= 45 else "Watch-out")
-                if "score_0_100" in dfb.columns:
-                    dfb["band"] = dfb["score_0_100"].apply(_band)
-                cols = [c for c in ["behavior","core","score_0_100","band","weight"] if c in dfb.columns]
-                story.append(Spacer(1, 2*mm))
-                story.append(Paragraph("Behaviour table (all behaviours)", h2))
-                tbl = add_table_from_df(dfb[cols], cols, header_labels=["Behaviour","Core","Score","Band","Weight"])
-                if tbl:
-                    story.append(tbl)
-            except Exception:
-                story.append(Paragraph("Could not render behavioural table in PDF (data format unexpected).", body_small))
+                        s = _safe_text(v)
+                    out_row.append(Paragraph(s, styles["Small"]))
+                else:
+                    out_row.append(Paragraph(_safe_text(v), styles["Small"]))
+            data.append(out_row)
 
-        story.append(PageBreak())
+        t = Table(data, colWidths=col_widths, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), COL_COPPER),
+            ("TEXTCOLOR", (0, 0), (-1, 0), rl_colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.2),
+            ("GRID", (0, 0), (-1, -1), 0.25, COL_GRID),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        # zebra stripes
+        for r in range(1, len(data)):
+            if r % 2 == 0:
+                t.setStyle(TableStyle([("BACKGROUND", (0, r), (-1, r), COL_LIGHT)]))
+        story.append(t)
+        story.append(Spacer(1, 8))
 
-    # Values congruence details
-    if isinstance(val, dict) and ("fit_0_100" in val or result.get("_values_table") is not None or get_tables_dict().get("values_table")):
-        story.append(Paragraph("Values congruence", h1))
-        if "fit_0_100" in val:
-            story.append(Paragraph(f"Fit: <b>{escape(fmt(val.get('fit_0_100')))}</b>/100 ({escape(str(val.get('band','—')))})", body_small))
-            story.append(Paragraph("Fit is a profile correlation (supplementary). Use gap patterns for onboarding/coaching discussion.", body_small))
-        if val.get("most_misaligned"):
-            story.append(Paragraph("Largest gaps (most misaligned)", h2))
-            story.extend(bullets([
-                f"{r.get('value','—')}: candidate {fmt(r.get('candidate'),0)} vs org {fmt(r.get('org'),0)} (gap {fmt(r.get('gap'),1)})"
-                for r in val.get("most_misaligned", [])
-            ]))
-
-        dfv = get_table("_values_table", "values_table")
-        if dfv is not None and len(dfv) > 0:
-            cols = [c for c in ["value","candidate","org","gap"] if c in dfv.columns]
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Values gap table", h2))
-            tbl = add_table_from_df(dfv[cols], cols, header_labels=["Value","Candidate","Org","Gap"])
-            if tbl:
-                story.append(tbl)
-
-        story.append(PageBreak())
-
-    # EI SJT details
-    if isinstance(ei, dict) and ("overall" in ei or result.get("_ei_table") is not None or get_tables_dict().get("ei_table")):
-        story.append(Paragraph("Emotional Intelligence (SJT)", h1))
-        if "overall" in ei:
-            story.append(Paragraph(f"Overall: <b>{escape(fmt(ei.get('overall')))}</b>/100 ({escape(str(ei.get('band','—')))})", body_small))
-
-        dfei = get_table("_ei_table", "ei_table")
-        if dfei is not None and len(dfei) > 0:
-            cols = [c for c in ["id","branch","answer","credit"] if c in dfei.columns]
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Scenario responses (summary)", h2))
-            tbl = add_table_from_df(dfei[cols], cols, header_labels=["ID","Branch","Answer","Credit"])
-            if tbl:
-                story.append(tbl)
-
-        branches = ei.get("branches") if isinstance(ei.get("branches"), dict) else {}
-        if branches:
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Branch scores", h2))
-            # sort by score
-            items = sorted(branches.items(), key=lambda x: (x[1] if isinstance(x[1], (int,float)) else -1), reverse=True)
-            story.extend(bullets([f"{k}: {fmt(v,0)}/100" for k, v in items]))
-
-        story.append(PageBreak())
-
-    # Personality (Big Five)
-    pers = result.get("personality", {}) if isinstance(result.get("personality", {}), dict) else {}
-    if pers:
-        story.append(Paragraph("Personality (Big Five)", h1))
-        arche = pers.get("archetype", "—")
-        story.append(Paragraph(f"Archetype label: <b>{escape(str(arche))}</b> (descriptive lens)", body_small))
-
-        traits = pers.get("traits") if isinstance(pers.get("traits"), dict) else {}
-        if traits:
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Trait profile", h2))
-            # traits table
-            pairs = [(k, f"{fmt(v,0)}/100") for k, v in sorted(traits.items(), key=lambda x: x[0])]
-            story.append(add_kv_table(pairs))
-
-        dfb5 = get_table("_big5_table", "big5_table")
-        if dfb5 is not None and len(dfb5) > 0:
-            cols = [c for c in ["id","trait","raw","scored","reverse"] if c in dfb5.columns]
-            if cols:
-                story.append(Spacer(1, 2*mm))
-                story.append(Paragraph("Item scoring (appendix)", h2))
-                tbl = add_table_from_df(dfb5[cols], cols, header_labels=cols, max_rows=60)
-                if tbl:
-                    story.append(tbl)
-                    story.append(Paragraph("Note: Appendix is truncated for readability.", body_small))
-
-        story.append(PageBreak())
-
-    # Leadership
-    lead = result.get("leadership", {}) if isinstance(result.get("leadership", {}), dict) else {}
-    if lead:
-        story.append(Paragraph("Leadership style", h1))
-        story.append(Paragraph(f"Style: <b>{escape(str(lead.get('style','—')))}</b>", body_small))
-        mods = lead.get("modifiers") if isinstance(lead.get("modifiers"), list) else []
-        if mods:
-            story.extend(bullets([f"Modifiers: {', '.join([str(m) for m in mods])}"]))
-        dims = lead.get("dims") if isinstance(lead.get("dims"), dict) else {}
-        if dims:
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Leadership dimensions", h2))
-            pairs = [(k, f"{fmt(v,0)}/100") for k, v in sorted(dims.items(), key=lambda x: x[0])]
-            story.append(add_kv_table(pairs))
-        dflead = get_table("_lead_table", "lead_table")
-        if dflead is not None and len(dflead) > 0:
-            cols = [c for c in ["id","dim","raw","scored","reverse"] if c in dflead.columns]
-            if cols:
-                story.append(Spacer(1, 2*mm))
-                story.append(Paragraph("Leadership item scoring (appendix)", h2))
-                tbl = add_table_from_df(dflead[cols], cols, header_labels=cols, max_rows=60)
-                if tbl:
-                    story.append(tbl)
-                    story.append(Paragraph("Note: Appendix is truncated for readability.", body_small))
-
-        story.append(PageBreak())
-
-    # Type lens + management prefs + conflict style
-    tl = result.get("type_lens", {}) if isinstance(result.get("type_lens", {}), dict) else {}
-    if tl:
-        story.append(Paragraph("Personality type lens (Type 1–9)", h1))
-        story.append(Paragraph(f"Top type: <b>{escape(str(tl.get('top_type','—')))}</b> • Wing: {escape(str(tl.get('wing','—')))}", body_small))
-        if tl.get("blend"):
-            story.append(Paragraph("Top two types are close — interpret as a blended profile.", body_small))
-
-        tips = tl.get("tips") if isinstance(tl.get("tips"), dict) else {}
-        if tips:
-            if tips.get("strengths"):
-                story.append(Paragraph("Likely strengths", h2))
-                story.extend(bullets(tips.get("strengths")))
-            if tips.get("watchouts"):
-                story.append(Paragraph("Watch-outs", h2))
-                story.extend(bullets(tips.get("watchouts")))
-            if tips.get("manage"):
-                story.append(Paragraph("How to manage / motivate", h2))
-                story.extend(bullets(tips.get("manage")))
-
-        if tl.get("likely_synergy") or tl.get("likely_friction"):
-            story.append(Paragraph("Interpersonal fit heuristics", h2))
-            if tl.get("likely_synergy"):
-                story.extend(bullets([f"Synergy: {x}" for x in tl.get("likely_synergy", [])]))
-            if tl.get("likely_friction"):
-                story.extend(bullets([f"Friction: {x}" for x in tl.get("likely_friction", [])]))
-
-        # Type scores table
-        type_scores = tl.get("scores") if isinstance(tl.get("scores"), dict) else {}
-        if type_scores:
-            try:
-                import pandas as pd
-                df = pd.DataFrame([{"type": k, "score_0_100": v} for k, v in type_scores.items()]).sort_values("score_0_100", ascending=False)
-                story.append(Spacer(1, 2*mm))
-                story.append(Paragraph("Type scores", h2))
-                tbl = add_table_from_df(df, ["type","score_0_100"], header_labels=["Type","Score"])
-                if tbl:
-                    story.append(tbl)
-            except Exception:
-                pass
-
-        story.append(PageBreak())
-
-    mp = result.get("management_prefs", {}) if isinstance(result.get("management_prefs", {}), dict) else {}
-    if mp:
-        story.append(Paragraph("Management preferences & motivators", h1))
-        dims = mp.get("dims") if isinstance(mp.get("dims"), dict) else {}
-        if dims:
-            story.append(Paragraph("Top dimensions", h2))
-            pairs = [(k, f"{fmt(v,0)}/100") for k, v in sorted(dims.items(), key=lambda x: x[1] if isinstance(x[1], (int,float)) else -1, reverse=True)]
-            # keep top 10
-            pairs = pairs[:10]
-            story.append(add_kv_table(pairs))
-
-        interps = mp.get("interpretations") if isinstance(mp.get("interpretations"), list) else []
-        if interps:
-            story.append(Paragraph("Interpretation", h2))
-            story.extend(bullets(interps))
-
-        cheat = mp.get("cheat_sheet") if isinstance(mp.get("cheat_sheet"), list) else []
-        if cheat:
-            story.append(Paragraph("Manager cheat sheet", h2))
-            story.extend(bullets(cheat))
-
-        story.append(PageBreak())
-
-    cs = result.get("conflict_style", {}) if isinstance(result.get("conflict_style", {}), dict) else {}
-    if cs:
-        story.append(Paragraph("Conflict style (scenarios)", h1))
-        story.append(Paragraph(f"Primary: <b>{escape(str(cs.get('primary','—')))}</b> • Secondary: {escape(str(cs.get('secondary','—')))}", body_small))
-        if cs.get("summary"):
-            story.append(Paragraph(escape(str(cs.get("summary"))), body_small))
-
-        counts = cs.get("counts") if isinstance(cs.get("counts"), dict) else {}
-        if counts:
-            story.append(Spacer(1, 2*mm))
-            story.append(Paragraph("Counts", h2))
-            pairs = [(k, str(v)) for k, v in sorted(counts.items(), key=lambda x: x[1], reverse=True)]
-            story.append(add_kv_table(pairs))
-
-        story.append(PageBreak())
-
-    # Notes + disclaimers
-    story.append(Paragraph("Examiner notes", h2))
-    if notes and notes.strip():
-        for ln in notes.strip().splitlines():
-            story.append(Paragraph(escape(ln), body_small))
+    # ---- Response quality
+    _add_section("Response quality flags (interpretation cautions)")
+    q = result.get("quality", {}) or {}
+    duration = q.get("duration_sec")
+    if duration is not None:
+        story.append(Paragraph(f"Completion time: <b>{float(duration):.0f}</b> seconds", styles["Body"]))
+        story.append(Spacer(1, 4))
+    warnings = q.get("warnings") or []
+    if warnings:
+        for w in warnings:
+            story.append(Paragraph(f"• <font color='#{COL_COPPER.hexval()[2:]}'>{_safe_text(w)}</font>", styles["Body"]))
     else:
-        story.append(Paragraph("—", body_small))
+        story.append(Paragraph("• No warning flags triggered.", styles["Body"]))
+    story.append(Spacer(1, 6))
 
-    story.append(Spacer(1, 4*mm))
-    story.append(Paragraph("Use boundaries & interpretation notes", h2))
-    story.extend(bullets([
-        "This tool is a structured decision support aid — not a clinical diagnosis and not a standalone hiring gate.",
-        "Interpret patterns (strengths, watch-outs, fit gaps) alongside interviews, work samples, and references.",
-        "If any response-quality flags triggered, corroborate with follow-up questions and re-test if appropriate.",
-        "For hiring use, run local validation, monitor fairness/bias, and comply with privacy and employment law.",
-    ]))
+    # ---- Behavioural details
+    if "behavioral" in result:
+        _add_section("Behavioural alignment details")
+        if beh.get("top_strengths"):
+            strengths = [f"{r['behavior']} ({float(r['score_0_100']):.0f})" for r in beh.get("top_strengths", []) if "behavior" in r]
+            if strengths:
+                story.append(Paragraph("<b>Top strengths</b>", styles["Body"]))
+                _bullet_list(strengths)
+                story.append(Spacer(1, 4))
+        if beh.get("watchouts"):
+            watch = [f"{r['behavior']} ({float(r['score_0_100']):.0f})" for r in beh.get("watchouts", []) if "behavior" in r]
+            if watch:
+                story.append(Paragraph("<b>Watch-outs</b>", styles["Body"]))
+                _bullet_list(watch)
+                story.append(Spacer(1, 6))
 
-    doc.build(story)
+        dfb = _df_from("_behavior_table", "behavior_table")
+        if dfb is not None and len(dfb):
+            # Management recommendations based on lowest behaviours
+            try:
+                recs = management_recommendations(dfb)
+            except Exception:
+                recs = []
+            if recs:
+                story.append(Paragraph("<b>Coaching priorities</b>", styles["Body"]))
+                for r in recs:
+                    story.append(Paragraph("• " + r.replace("**", ""), styles["Body"]))
+                story.append(Spacer(1, 6))
+
+            # Full table
+            cols = [("behavior", "Behaviour"), ("core", "Core"), ("score_0_100", "Score"), ("weight", "Weight")]
+            col_widths = [doc.width*0.52, doc.width*0.10, doc.width*0.18, doc.width*0.20]
+            _table_from_df(dfb, cols, col_widths, number_cols={"score_0_100", "weight"})
+
+    # ---- Values details
+    if "values" in result:
+        _add_section("Values congruence details")
+        if val.get("most_misaligned"):
+            mmis = [f"{r.get('value','')} (gap {float(r.get('gap',0)):+.1f})" for r in val.get("most_misaligned", [])]
+            if mmis:
+                story.append(Paragraph("<b>Most misaligned values</b> (largest gaps)", styles["Body"]))
+                _bullet_list(mmis)
+                story.append(Spacer(1, 6))
+
+        dfv = _df_from("_values_table", "values_table")
+        if dfv is not None and len(dfv):
+            cols = [("value", "Value"), ("candidate", "Candidate"), ("org", "Org"), ("gap", "Gap")]
+            col_widths = [doc.width*0.46, doc.width*0.18, doc.width*0.18, doc.width*0.18]
+            _table_from_df(dfv, cols, col_widths, number_cols={"candidate", "org", "gap"})
+
+    # ---- EI details
+    if "ei" in result:
+        _add_section("Emotional intelligence (SJT) details")
+        branches = ei.get("branches") or {}
+        if isinstance(branches, dict) and branches:
+            topb = sorted(branches.items(), key=lambda x: (float(x[1]) if x[1] is not None else -1), reverse=True)
+            txt = ", ".join([f"{k}: {float(v):.0f}" for k, v in topb if v is not None and not (isinstance(v, float) and math.isnan(v))])
+            if txt:
+                story.append(Paragraph("<b>Branch scores</b>: " + txt, styles["Body"]))
+                story.append(Spacer(1, 6))
+
+        dfe = _df_from("_ei_table", "ei_table")
+        if dfe is not None and len(dfe):
+            cols = [("id", "Item"), ("branch", "Branch"), ("answer", "Answer"), ("credit", "Credit")]
+            col_widths = [doc.width*0.14, doc.width*0.36, doc.width*0.18, doc.width*0.32]
+            _table_from_df(dfe, cols, col_widths, number_cols={"credit"})
+
+    # ---- Big Five
+    if "personality" in result:
+        _add_section("Personality (Big Five) details")
+        archetype = _safe_text((result.get("personality") or {}).get("archetype"))
+        story.append(Paragraph(f"Archetype: <b>{archetype}</b>", styles["Body"]))
+        traits = (result.get("personality") or {}).get("traits") or {}
+        if isinstance(traits, dict) and traits:
+            df_traits = pd.DataFrame([{"trait": k, "score_0_100": v} for k, v in traits.items()])
+            cols = [("trait", "Trait"), ("score_0_100", "Score")]
+            col_widths = [doc.width*0.65, doc.width*0.35]
+            _table_from_df(df_traits, cols, col_widths, number_cols={"score_0_100"})
+
+    # ---- Leadership
+    if "leadership" in result:
+        _add_section("Leadership style details")
+        l = result.get("leadership") or {}
+        story.append(Paragraph(f"Style: <b>{_safe_text(l.get('style'))}</b>", styles["Body"]))
+        dims = l.get("dims") or {}
+        if isinstance(dims, dict) and dims:
+            df_dims = pd.DataFrame([{"dimension": k, "score_0_100": v} for k, v in dims.items()])
+            cols = [("dimension", "Dimension"), ("score_0_100", "Score")]
+            col_widths = [doc.width*0.65, doc.width*0.35]
+            _table_from_df(df_dims, cols, col_widths, number_cols={"score_0_100"})
+
+    # ---- Type lens
+    if "type_lens" in result:
+        _add_section("Personality type lens (Type 1–9)")
+        tl = result.get("type_lens") or {}
+        story.append(Paragraph(f"Top type: <b>{_safe_text(tl.get('top_type'))}</b>  •  Wing: <b>{_safe_text(tl.get('wing'))}</b>", styles["Body"]))
+        if tl.get("likely_synergy"):
+            story.append(Paragraph("<b>Likely synergy with</b>: " + ", ".join([_safe_text(x) for x in tl.get("likely_synergy", [])]), styles["Body"]))
+        if tl.get("likely_friction"):
+            story.append(Paragraph("<b>Likely friction with</b>: " + ", ".join([_safe_text(x) for x in tl.get("likely_friction", [])]), styles["Body"]))
+        tips = tl.get("tips") or []
+        if tips:
+            story.append(Spacer(1, 4))
+            story.append(Paragraph("<b>Coaching tips</b>", styles["Body"]))
+            for t in tips[:8]:
+                story.append(Paragraph("• " + _safe_text(t), styles["Body"]))
+        # Optional type table if present
+        dft = _df_from("_type_table", "type_table")
+        if dft is not None and len(dft):
+            # table can be large; keep it compact
+            cols = [("type", "Type"), ("score_0_100", "Score")]
+            if "type" not in dft.columns and "label" in dft.columns:
+                dft = dft.rename(columns={"label": "type"})
+            if "score_0_100" not in dft.columns and "score" in dft.columns:
+                dft = dft.rename(columns={"score": "score_0_100"})
+            col_widths = [doc.width*0.65, doc.width*0.35]
+            _table_from_df(dft[["type","score_0_100"]], cols, col_widths, number_cols={"score_0_100"})
+
+    # ---- Management prefs
+    if "management_prefs" in result:
+        _add_section("Management preferences (how to manage me)")
+        mp = result.get("management_prefs") or {}
+        cheat = mp.get("cheat_sheet") or []
+        if cheat:
+            story.append(Paragraph("<b>Manager cheat sheet</b>", styles["Body"]))
+            for c in cheat[:10]:
+                story.append(Paragraph("• " + _safe_text(c), styles["Body"]))
+            story.append(Spacer(1, 6))
+        dims = mp.get("dims") or {}
+        if isinstance(dims, dict) and dims:
+            df_dims = pd.DataFrame([{"dimension": k, "score_0_100": v} for k, v in dims.items()]).sort_values("score_0_100", ascending=False)
+            cols = [("dimension", "Dimension"), ("score_0_100", "Score")]
+            col_widths = [doc.width*0.65, doc.width*0.35]
+            _table_from_df(df_dims, cols, col_widths, number_cols={"score_0_100"})
+
+    # ---- Conflict style
+    if "conflict_style" in result:
+        _add_section("Conflict style scenarios")
+        cs = result.get("conflict_style") or {}
+        story.append(Paragraph(f"Primary: <b>{_safe_text(cs.get('primary'))}</b>  •  Secondary: <b>{_safe_text(cs.get('secondary'))}</b>", styles["Body"]))
+        if cs.get("summary"):
+            story.append(Paragraph(_safe_text(cs.get("summary")), styles["Body"]))
+            story.append(Spacer(1, 6))
+
+        dfc = _df_from("_conflict_table", "conflict_table")
+        if dfc is not None and len(dfc):
+            cols = [("id", "Item"), ("choice", "Choice"), ("style", "Style")]
+            col_widths = [doc.width*0.20, doc.width*0.20, doc.width*0.60]
+            _table_from_df(dfc, cols, col_widths, number_cols=set())
+
+    # ---- Examiner notes
+    if notes and str(notes).strip():
+        _add_section("Examiner notes")
+        for ln in str(notes).strip().splitlines():
+            story.append(Paragraph("• " + _safe_text(ln), styles["Body"]))
+
+    # ---- footer disclaimer
+    story.append(Spacer(1, 10))
+    disclaimer = (
+        "This report is a research-aligned decision-support output. "
+        "Do not use as a sole hiring gatekeeper. Validate locally, monitor fairness/bias, "
+        "and interpret patterns (not single micro-scores), especially when response-quality flags trigger."
+    )
+    story.append(Paragraph(disclaimer, ParagraphStyle("Disclaimer", parent=styles["Small"], textColor=HexColor("#555555"))))
+
+    # Page numbers
+    def _on_page(canvas, doc_):
+        canvas.saveState()
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillColor(HexColor("#666666"))
+        canvas.drawRightString(doc_.pagesize[0] - 18*mm, 10*mm, f"Page {doc_.page}")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
     buffer.seek(0)
     return buffer.read()
-
 
 # -----------------------------
 # App pages
@@ -2356,7 +2328,7 @@ def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = No
         role_weights = st.session_state.get("role_weights", {b["id"]: 1.0 for b in BEHAVIORS})
         org_values = st.session_state.get("org_values", {v: 4 for v in VALUES_DIMENSIONS})
 
-        results: Dict[str, Any] = {"candidate_name": candidate_name, "role": role_name, "date": time.strftime("%Y-%m-%d")}
+        results: Dict[str, Any] = {"candidate_name": candidate_name, "role": role_name, "org": st.session_state.get("org_name",""), "date": time.strftime("%Y-%m-%d")}
 
         if use_beh:
             beh = score_behavioral(beh_res, role_weights)
@@ -2459,44 +2431,27 @@ def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = No
                 "ei_sjt": float(results.get("ei", {}).get("overall", float("nan"))) if "ei" in results else None,
             }
 
-            # Store a compact report payload PLUS the detailed tables (so the admin dashboard can render the same detail later).
+
             report_json = {k: v for k, v in results.items() if not k.startswith("_")}
-
-            def _df_to_records(df):
-                try:
-                    # to_json avoids numpy types and ensures JSON-safe values
-                    return json.loads(df.to_json(orient="records"))
-                except Exception:
-                    try:
-                        return df.to_dict("records")
-                    except Exception:
-                        return None
-
-            tables = {}
-            try:
-                if "_behavior_table" in results and results["_behavior_table"] is not None:
-                    tables["behavior_table"] = _df_to_records(results["_behavior_table"])
-                if "_values_table" in results and results["_values_table"] is not None:
-                    tables["values_table"] = _df_to_records(results["_values_table"])
-                if "_ei_table" in results and results["_ei_table"] is not None:
-                    tables["ei_table"] = _df_to_records(results["_ei_table"])
-                if "_big5_table" in results and results["_big5_table"] is not None:
-                    tables["big5_table"] = _df_to_records(results["_big5_table"])
-                if "_lead_table" in results and results["_lead_table"] is not None:
-                    tables["lead_table"] = _df_to_records(results["_lead_table"])
-                if "_type_table" in results and results["_type_table"] is not None:
-                    tables["type_table"] = _df_to_records(results["_type_table"])
-                if "_mgmt_table" in results and results["_mgmt_table"] is not None:
-                    tables["mgmt_table"] = _df_to_records(results["_mgmt_table"])
-                if "_conflict_table" in results and results["_conflict_table"] is not None:
-                    tables["conflict_table"] = _df_to_records(results["_conflict_table"])
-            except Exception:
-                tables = {}
-
-            # Only attach if we successfully serialized anything
-            if isinstance(tables, dict) and any(v for v in tables.values()):
+            # Attach detailed tables (if present) so PDFs generated later can match the rich dashboard display.
+            table_map = {
+                "_behavior_table": "behavior_table",
+                "_values_table": "values_table",
+                "_ei_table": "ei_table",
+                "_big5_table": "big5_table",
+                "_lead_table": "lead_table",
+                "_type_table": "type_table",
+                "_mgmt_table": "mgmt_table",
+                "_conflict_table": "conflict_table",
+            }
+            tables: Dict[str, Any] = {}
+            for k, name in table_map.items():
+                if k in results and isinstance(results[k], pd.DataFrame):
+                    df = results[k].copy()
+                    df = df.where(pd.notnull(df), None)  # JSON-safe
+                    tables[name] = df.to_dict(orient="records")
+            if tables:
                 report_json["tables"] = tables
-
             try:
                 sb_store_result(invite_id, scores_json=scores_json, report_json=report_json)
                 sb_mark_invite_completed(invite_id)
