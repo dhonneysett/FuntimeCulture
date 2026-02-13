@@ -1527,12 +1527,44 @@ BEHAVIOR_COACHING_TIPS = {
 }
 
 def management_recommendations(behavior_table: pd.DataFrame) -> List[str]:
+    """
+    Defensive coaching recommendations.
+    Handles older/partial tables that may not include score_0_100 yet.
+    """
     if behavior_table is None or len(behavior_table) == 0:
         return []
-    df = behavior_table.dropna(subset=["score_0_100"]).sort_values("score_0_100", ascending=True).head(4)
-    recs = []
+
+    df = behavior_table.copy()
+
+    # Ensure score_0_100 exists (older saved tables may use different column names)
+    if "score_0_100" not in df.columns:
+        # common alternates
+        for alt in ["score", "score_pct", "pct", "percent", "score0_100", "score_100"]:
+            if alt in df.columns:
+                df["score_0_100"] = pd.to_numeric(df[alt], errors="coerce")
+                break
+
+    if "score_0_100" not in df.columns and "mean_likert" in df.columns:
+        s = pd.to_numeric(df["mean_likert"], errors="coerce")
+        df["score_0_100"] = s.apply(lambda x: pct(float(x)) if pd.notna(x) else float("nan"))
+
+    if "score_0_100" not in df.columns:
+        return []
+
+    # Behavior label normalization
+    if "behavior" not in df.columns and "Behaviour" in df.columns:
+        df = df.rename(columns={"Behaviour": "behavior"})
+
+    df = df.dropna(subset=["score_0_100"])
+    if len(df) == 0 or "behavior" not in df.columns:
+        return ["Use the watch-out behaviours as coaching priorities: define 1–2 target behaviours and review weekly."]
+
+    df = df.sort_values("score_0_100", ascending=True).head(4)
+    recs: List[str] = []
     for _, row in df.iterrows():
-        name = row["behavior"]
+        name = row.get("behavior")
+        if not name:
+            continue
         tips = BEHAVIOR_COACHING_TIPS.get(name, [])
         if tips:
             recs.append(f"**{name}**: {tips[0]}")
@@ -1962,7 +1994,11 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
             if "score_0_100" not in dft.columns and "score" in dft.columns:
                 dft = dft.rename(columns={"score": "score_0_100"})
             col_widths = [doc.width*0.65, doc.width*0.35]
-            _table_from_df(dft[["type","score_0_100"]], cols, col_widths, number_cols={"score_0_100"})
+            if "type" in dft.columns and "score_0_100" in dft.columns:
+                _table_from_df(dft[["type","score_0_100"]], cols, col_widths, number_cols={"score_0_100"})
+            else:
+                # Older results may not include score columns; skip gracefully
+                story.append(Paragraph("Type score table unavailable (incomplete saved data).", styles["Small"]))
 
     # ---- Management prefs
     if "management_prefs" in result:
