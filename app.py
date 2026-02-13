@@ -1629,7 +1629,7 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
                               fontSize=9.5, leading=12, textColor=COL_CHARCOAL))
     styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontName="Helvetica",
                               fontSize=8.2, leading=10.5, textColor=COL_CHARCOAL))
-    styles.add(ParagraphStyle(name="Bullet", parent=styles["Normal"], fontName="Helvetica",
+    styles.add(ParagraphStyle(name="VervioBullet", parent=styles["Normal"], fontName="Helvetica",
                               fontSize=9.2, leading=12, leftIndent=12, bulletIndent=6,
                               textColor=COL_CHARCOAL))
 
