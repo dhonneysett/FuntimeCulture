@@ -1571,6 +1571,40 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
         except Exception:
             return fallback
         return s if s else fallback
+    def _ensure_list(x: Any) -> List[str]:
+        """Coerce x into a list of strings (safe for slicing/iteration in PDFs)."""
+        if x is None:
+            return []
+        if isinstance(x, list):
+            return [str(i) for i in x if str(i).strip()]
+        if isinstance(x, (tuple, set)):
+            return [str(i) for i in list(x) if str(i).strip()]
+        if isinstance(x, dict):
+            out: List[str] = []
+            for v in x.values():
+                if v is None:
+                    continue
+                if isinstance(v, (list, tuple, set)):
+                    out.extend([str(i) for i in v if str(i).strip()])
+                else:
+                    s = str(v).strip()
+                    if s:
+                        out.append(s)
+            return out
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return []
+            if "\n" in s:
+                return [ln.strip() for ln in s.splitlines() if ln.strip()]
+            return [s]
+        # last-resort: try iterable
+        try:
+            return [str(i) for i in list(x) if str(i).strip()]
+        except Exception:
+            s = str(x).strip()
+            return [s] if s else []
+
 
     def _fmt_pct(x: Any) -> str:
         try:
@@ -1906,11 +1940,13 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
         _add_section("Personality type lens (Type 1–9)")
         tl = result.get("type_lens") or {}
         story.append(Paragraph(f"Top type: <b>{_safe_text(tl.get('top_type'))}</b>  •  Wing: <b>{_safe_text(tl.get('wing'))}</b>", styles["Body"]))
-        if tl.get("likely_synergy"):
-            story.append(Paragraph("<b>Likely synergy with</b>: " + ", ".join([_safe_text(x) for x in tl.get("likely_synergy", [])]), styles["Body"]))
-        if tl.get("likely_friction"):
-            story.append(Paragraph("<b>Likely friction with</b>: " + ", ".join([_safe_text(x) for x in tl.get("likely_friction", [])]), styles["Body"]))
-        tips = tl.get("tips") or []
+        synergy = _ensure_list(tl.get("likely_synergy"))
+        if synergy:
+            story.append(Paragraph("<b>Likely synergy with</b>: " + ", ".join([_safe_text(x) for x in synergy]), styles["Body"]))
+        friction = _ensure_list(tl.get("likely_friction"))
+        if friction:
+            story.append(Paragraph("<b>Likely friction with</b>: " + ", ".join([_safe_text(x) for x in friction]), styles["Body"]))
+        tips = _ensure_list(tl.get("tips"))
         if tips:
             story.append(Spacer(1, 4))
             story.append(Paragraph("<b>Coaching tips</b>", styles["Body"]))
@@ -1932,7 +1968,7 @@ def make_pdf_report(result: Dict[str, Any], candidate: str, role: str, notes: st
     if "management_prefs" in result:
         _add_section("Management preferences (how to manage me)")
         mp = result.get("management_prefs") or {}
-        cheat = mp.get("cheat_sheet") or []
+        cheat = _ensure_list(mp.get("cheat_sheet"))
         if cheat:
             story.append(Paragraph("<b>Manager cheat sheet</b>", styles["Body"]))
             for c in cheat[:10]:
