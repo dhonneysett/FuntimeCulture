@@ -73,6 +73,107 @@ def make_token() -> str:
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+
+def get_query_param(name: str) -> str | None:
+    """Robust query param fetch across Streamlit versions."""
+    try:
+        v = st.query_params.get(name)
+        if isinstance(v, list):
+            return v[0] if v else None
+        return v
+    except Exception:
+        try:
+            v = st.experimental_get_query_params().get(name)
+            return v[0] if v else None
+        except Exception:
+            return None
+
+
+def secret_truthy(name: str, default: bool = False) -> bool:
+    try:
+        raw = st.secrets.get(name, default)
+    except Exception:
+        raw = default
+    if isinstance(raw, bool):
+        return raw
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off", ""):
+        return False
+    return bool(default)
+
+
+def get_profile_snapshot(
+    role_label: str,
+    org_name: str | None = None,
+    modules: Dict[str, bool] | None = None,
+    lock_modules: bool = True,
+) -> Dict[str, Any]:
+    """Snapshot the current Org/Role configuration into a JSON-able dict.
+
+    This is stored on the invite row so the candidate uses the exact same
+    parameters you configured at invite creation time.
+    """
+    snap = {
+        "version": "bea_mvp_1.1",
+        "captured_at": _now_utc_iso(),
+        "org_name": (org_name or st.session_state.get("org_name", "")).strip(),
+        "role_label": (role_label or "").strip(),
+        "org_values": st.session_state.get("org_values", {v: 4 for v in VALUES_DIMENSIONS}),
+        "role_weights": st.session_state.get("role_weights", {b["id"]: 1.0 for b in BEHAVIORS}),
+        "modules": modules or {
+            "behaviour": True,
+            "values": True,
+            "ei_sjt": True,
+            "big5": True,
+            "leadership": True,
+            "type_lens": True,
+            "mgmt_prefs": True,
+            "conflict": True,
+        },
+        "lock_modules": bool(lock_modules),
+    }
+    return snap
+
+
+def apply_profile_snapshot(snap: Dict[str, Any] | None) -> None:
+    """Apply a stored snapshot into session_state for consistent scoring."""
+    if not snap:
+        return
+    try:
+        org_vals = snap.get("org_values")
+        if isinstance(org_vals, dict) and org_vals:
+            # ensure all dimensions exist
+            merged = {v: 4 for v in VALUES_DIMENSIONS}
+            for k, v in org_vals.items():
+                if k in merged:
+                    try:
+                        merged[k] = float(v)
+                    except Exception:
+                        pass
+            st.session_state["org_values"] = merged
+
+        role_w = snap.get("role_weights")
+        if isinstance(role_w, dict) and role_w:
+            merged_w = {b["id"]: 1.0 for b in BEHAVIORS}
+            for k, v in role_w.items():
+                if k in merged_w:
+                    try:
+                        merged_w[k] = float(v)
+                    except Exception:
+                        pass
+            st.session_state["role_weights"] = merged_w
+
+        if isinstance(snap.get("org_name"), str) and snap.get("org_name").strip():
+            st.session_state["org_name"] = snap["org_name"].strip()
+
+        if isinstance(snap.get("role_label"), str) and snap.get("role_label").strip():
+            st.session_state["default_role_label"] = snap["role_label"].strip()
+    except Exception:
+        # Never fail the whole app if a snapshot has unexpected structure
+        pass
+
 def parse_dt(val: str) -> datetime:
     """Parse ISO timestamps returned by Supabase."""
     # Supabase typically returns ISO strings with timezone info.
@@ -109,11 +210,15 @@ def sb_get_invite_by_token(token: str) -> Dict[str, Any] | None:
     data = getattr(res, "data", None) or []
     return data[0] if data else None
 
+
 def sb_mark_invite_started(invite_id: int) -> None:
     if not supabase_available():
         return
     try:
-        sb.table("invites").update({"status": "started"}).eq("id", invite_id).execute()
+        sb.table("invites").update({
+            "status": "started",
+            "started_at": _now_utc_iso(),
+        }).eq("id", invite_id).execute()
     except Exception:
         pass
 
@@ -133,8 +238,31 @@ def sb_expire_invite(invite_id: int) -> None:
     except Exception:
         pass
 
-def sb_create_invite(role: str, candidate_email: str | None, expires_days: int = 7) -> Dict[str, Any]:
-    """Create an invite record and return {token, link, invite_id}."""
+
+def sb_revoke_invite(invite_id: int) -> None:
+    if not supabase_available():
+        return
+    try:
+        sb.table("invites").update({
+            "status": "revoked",
+            "revoked_at": _now_utc_iso(),
+        }).eq("id", invite_id).execute()
+    except Exception:
+        pass
+
+
+def sb_create_invite(
+    role: str,
+    candidate_email: str | None,
+    expires_days: int = 7,
+    org: str | None = None,
+    config_json: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Create an invite record and return {token, link, invite_id}.
+
+    - org + config_json allow you to snapshot the Org/Role profile at invite creation time
+      (so the candidate assessment uses the exact same parameters, even if you later change them).
+    """
     if not supabase_available():
         raise RuntimeError("Supabase is not configured.")
     if "APP_BASE_URL" not in st.secrets:
@@ -144,20 +272,22 @@ def sb_create_invite(role: str, candidate_email: str | None, expires_days: int =
     th = hash_token(token)
     expires_at = (datetime.now(timezone.utc) + timedelta(days=int(expires_days))).isoformat()
 
-    payload = {
+    payload: Dict[str, Any] = {
         "candidate_email": candidate_email or None,
         "role": role,
         "token_hash": th,
         "status": "invited",
         "expires_at": expires_at,
+        "org": (org or "").strip() or None,
+        "config_json": config_json or None,
     }
     out = sb.table("invites").insert(payload).execute()
     invite_row = (getattr(out, "data", None) or [None])[0]
     invite_id = invite_row["id"] if invite_row and "id" in invite_row else None
 
-    link = f'{st.secrets["APP_BASE_URL"]}/?token={token}'
+    base = str(st.secrets["APP_BASE_URL"]).rstrip("/")
+    link = f"{base}/?token={token}"
     return {"token": token, "token_hash": th, "link": link, "invite_id": invite_id}
-
 def sb_store_result(invite_id: int, scores_json: Dict[str, Any], report_json: Dict[str, Any]) -> None:
     if not supabase_available():
         return
@@ -166,6 +296,31 @@ def sb_store_result(invite_id: int, scores_json: Dict[str, Any], report_json: Di
         "scores_json": scores_json,
         "report_json": report_json,
     }).execute()
+
+
+def sb_upload_pdf_to_storage(invite_id: int, pdf_bytes: bytes) -> str | None:
+    """Optional: upload the PDF to Supabase Storage and return the stored path.
+
+    To enable:
+      - Create a Storage bucket (e.g. 'bea-reports')
+      - Add SUPABASE_REPORTS_BUCKET in Streamlit Secrets with that bucket name
+    """
+    if not supabase_available():
+        return None
+    bucket = str(st.secrets.get("SUPABASE_REPORTS_BUCKET", "")).strip() if hasattr(st, "secrets") else ""
+    if not bucket:
+        return None
+    try:
+        key = f"reports/invite_{invite_id}_{uuid.uuid4().hex[:8]}.pdf"
+        sb.storage.from_(bucket).upload(
+            key,
+            pdf_bytes,
+            {"content-type": "application/pdf", "upsert": "true"},
+        )
+        return key
+    except Exception:
+        return None
+
 APP_TITLE = "BEA • Behavioural & Emotional Alignment Assessment (Prototype)"
 VERSION = "0.2.0"
 
@@ -1538,36 +1693,94 @@ def page_home():
     )
     st.write("Choose a page from the sidebar to configure a role profile, run an assessment, or view research notes.")
 
+
 def page_org_setup():
     st.header("Organisation & Role Setup")
-    st.write("Define an organisation values profile and role-specific weighting for the 20 behaviours.")
+    st.write("Set your organisation's values profile and the role-specific weighting for the 20 behaviours. "
+             "When you generate a token invite, the **current settings can be snapshotted** into that invite "
+             "(so candidates are scored against the correct parameters).")
 
-    with st.expander("Organisation values profile (used for values-fit profile comparison)", expanded=True):
+    # Basic labels used in invites / reporting
+    col0a, col0b = st.columns([2, 2])
+    with col0a:
+        org_name = st.text_input("Organisation name (label)", value=st.session_state.get("org_name", ""))
+        st.session_state["org_name"] = org_name
+    with col0b:
+        default_role = st.text_input("Default role label (suggested)", value=st.session_state.get("default_role_label", "Candidate Role"))
+        st.session_state["default_role_label"] = default_role
+
+    st.divider()
+
+    with st.expander("1) Organisation values profile (used for values-fit comparison)", expanded=True):
         org = st.session_state.get("org_values", {v: 4 for v in VALUES_DIMENSIONS})
+
         cols = st.columns(2)
-        new_org = {}
-        for i, v in enumerate(VALUES_DIMENSIONS):
+        updated = {}
+        for i, dim in enumerate(VALUES_DIMENSIONS):
             with cols[i % 2]:
-                new_org[v] = st.select_slider(v, options=[1,2,3,4,5], value=int(org.get(v, 4)), format_func=lambda x: VALUES_SCALE_LABELS[x-1])
-        st.session_state["org_values"] = new_org
+                updated[dim] = st.slider(
+                    dim,
+                    min_value=1,
+                    max_value=5,
+                    value=int(org.get(dim, 4)),
+                    help="1 = low emphasis, 5 = very strong emphasis in your culture.",
+                )
+        st.session_state["org_values"] = updated
 
-    with st.expander("Role weights for behaviour alignment (optional)", expanded=True):
-        st.write("Weight behaviours that are more critical for this role. Default is 1.0.")
-        role_weights = st.session_state.get("role_weights", {b["id"]: 1.0 for b in BEHAVIORS})
-        new_weights = {}
-        for b in BEHAVIORS:
-            new_weights[b["id"]] = st.slider(
-                f"{b['id']} • {b['name']}", min_value=0.0, max_value=3.0, value=float(role_weights.get(b["id"], 1.0)), step=0.25
-            )
-        st.session_state["role_weights"] = new_weights
+        st.caption("Tip: Keep this realistic (what your culture actually rewards), not aspirational (what you wish it was).")
 
-    profile = {
-        "org_values": st.session_state["org_values"],
-        "role_weights": st.session_state["role_weights"],
-        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "version": VERSION,
-    }
-    st.download_button("Download profile JSON", data=json.dumps(profile, indent=2).encode("utf-8"), file_name="bea_profile.json", mime="application/json")
+    with st.expander("2) Role weighting for the 20 behaviours (used for the behavioural alignment score)", expanded=True):
+        weights = st.session_state.get("role_weights", {b["id"]: 1.0 for b in BEHAVIORS})
+
+        st.write("Higher weights = the behaviour matters more for this role. "
+                 "Neutral is **1.0**. Typical range is **0.5–2.0**.")
+        cols = st.columns(2)
+        updated_w = {}
+        for i, beh in enumerate(BEHAVIORS):
+            with cols[i % 2]:
+                beh_id = beh["id"]
+                label = f"{beh_id} — {beh['name']}"
+                updated_w[beh_id] = st.slider(
+                    label,
+                    min_value=0.5,
+                    max_value=2.0,
+                    value=float(weights.get(beh_id, 1.0)),
+                    step=0.1,
+                )
+        st.session_state["role_weights"] = updated_w
+
+    st.divider()
+
+    colr1, colr2, colr3 = st.columns([1, 1, 2])
+    with colr1:
+        if st.button("Reset values to neutral (4/5)"):
+            st.session_state["org_values"] = {v: 4 for v in VALUES_DIMENSIONS}
+            st.rerun()
+    with colr2:
+        if st.button("Reset weights to neutral (1.0)"):
+            st.session_state["role_weights"] = {b["id"]: 1.0 for b in BEHAVIORS}
+            st.rerun()
+    with colr3:
+        st.info("These settings affect scoring. For hiring use, snapshot settings into each invite from the Vervio Dashboard.")
+
+    # Snapshot preview
+    st.subheader("Snapshot preview (what gets stored on an invite)")
+    preview = get_profile_snapshot(
+        role_label=st.session_state.get("default_role_label", "Candidate Role"),
+        org_name=st.session_state.get("org_name", ""),
+    )
+    # Don't show all weights in full (busy); show counts + a few examples
+    st.write({
+        "org_name": preview.get("org_name"),
+        "role_label": preview.get("role_label"),
+        "values_dimensions": len((preview.get("org_values") or {}).keys()),
+        "behaviours_weighted": len((preview.get("role_weights") or {}).keys()),
+        "example_weights": dict(list((preview.get("role_weights") or {}).items())[:5]),
+        "modules": preview.get("modules"),
+        "lock_modules": preview.get("lock_modules"),
+        "version": preview.get("version"),
+    })
+
 
 def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = None):
     st.header("Candidate Assessment")
@@ -1583,10 +1796,45 @@ def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = No
         st.warning("Please tick the consent checkbox to proceed.")
         st.stop()
 
-    # In token mode (candidate link), role is fixed to the invite.
+    
+    # Token-mode config snapshot
+    cfg: Dict[str, Any] = {}
+    org_label = ""
+    module_defaults = {
+        "behaviour": True,
+        "values": True,
+        "ei_sjt": True,
+        "big5": True,
+        "leadership": True,
+        "type_lens": True,
+        "mgmt_prefs": True,
+        "conflict": True,
+    }
+    lock_modules = False
+
+    if token_mode and invite:
+        cfg = invite.get("config_json") or {}
+        apply_profile_snapshot(cfg)
+        org_label = (invite.get("org") or cfg.get("org_name") or "").strip()
+        try:
+            mods = cfg.get("modules")
+            if isinstance(mods, dict):
+                for k in module_defaults:
+                    if k in mods:
+                        module_defaults[k] = bool(mods.get(k))
+        except Exception:
+            pass
+        lock_modules = bool(cfg.get("lock_modules", True))
+
+
+# In token mode (candidate link), role is fixed to the invite.
     if token_mode and invite:
         candidate_name = st.text_input("Your name (optional — helps the examiner interpret the report)", value="")
+        if org_label:
+            st.text_input("Organisation", value=org_label, disabled=True)
         role_name = st.text_input("Role / position", value=str(invite.get("role", "")), disabled=True)
+        if cfg:
+            st.caption(f"Assessment config captured: {cfg.get('captured_at', '?')} • version {cfg.get('version', '?')}")
         # For token mode we avoid local file logging; results are stored to Supabase (server-side).
         store_for_stats = False
         store_identifiable = False
@@ -1611,21 +1859,56 @@ def page_assessment(token_mode: bool = False, invite: Dict[str, Any] | None = No
 
     
     st.subheader("Modules")
+    if token_mode and invite and lock_modules:
+        st.caption("Modules are set by the examiner for standardisation.")
     colA, colB, colC, colD = st.columns(4)
+    disable_mods = bool(token_mode and invite and lock_modules)
     with colA:
-        use_beh = st.checkbox("Behavioural alignment (20 behaviours)", value=True)
-        use_values = st.checkbox("Values congruence (P–O fit)", value=True)
+        use_beh = st.checkbox(
+            "Behavioural alignment (20 behaviours)",
+            value=bool(module_defaults.get("behaviour", True)),
+            disabled=disable_mods,
+        )
+        use_values = st.checkbox(
+            "Values congruence (P–O fit)",
+            value=bool(module_defaults.get("values", True)),
+            disabled=disable_mods,
+        )
     with colB:
-        use_ei = st.checkbox("EI scenario test (SJT)", value=True)
-        use_big5 = st.checkbox("Personality profile (Big Five)", value=True)
+        use_ei = st.checkbox(
+            "EI scenario test (SJT)",
+            value=bool(module_defaults.get("ei_sjt", True)),
+            disabled=disable_mods,
+        )
+        use_big5 = st.checkbox(
+            "Personality profile (Big Five)",
+            value=bool(module_defaults.get("big5", True)),
+            disabled=disable_mods,
+        )
     with colC:
-        use_lead = st.checkbox("Leadership style (for supervisors/managers)", value=True)
-        use_types = st.checkbox("Personality type lens (Type 1–9)", value=True)
+        use_lead = st.checkbox(
+            "Leadership style (for supervisors/managers)",
+            value=bool(module_defaults.get("leadership", True)),
+            disabled=disable_mods,
+        )
+        use_types = st.checkbox(
+            "Personality type lens (Type 1–9)",
+            value=bool(module_defaults.get("type_lens", True)),
+            disabled=disable_mods,
+        )
     with colD:
-        use_mgmt_prefs = st.checkbox("Management preferences & motivators", value=True)
-        use_conflict = st.checkbox("Conflict style scenarios (no right/wrong)", value=True)
-
+        use_mgmt_prefs = st.checkbox(
+            "Management preferences & motivators",
+            value=bool(module_defaults.get("mgmt_prefs", True)),
+            disabled=disable_mods,
+        )
+        use_conflict = st.checkbox(
+            "Conflict style scenarios (no right/wrong)",
+            value=bool(module_defaults.get("conflict", True)),
+            disabled=disable_mods,
+        )
     st.divider()
+
     responses: Dict[str, Any] = {}
 
     if use_beh:
@@ -2024,24 +2307,83 @@ def page_vervio_dashboard():
     require_admin()
 
     st.subheader("Create invite link")
+    st.caption("Tip: Configure Org & Role first (Org & Role Setup). Then generate a token link here — the invite can store a snapshot of those settings.")
+
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
-        role = st.text_input("Role", value="Candidate Role")
+        org = st.text_input("Organisation (label)", value=st.session_state.get("org_name", ""))
+        role = st.text_input("Role", value=st.session_state.get("default_role_label", "Candidate Role"))
     with col2:
         email = st.text_input("Candidate email (optional)", value="")
     with col3:
         expires_days = st.number_input("Expires (days)", min_value=1, max_value=30, value=7)
 
+    with st.expander("Invite settings (what the candidate will be scored against)", expanded=True):
+        snapshot = st.checkbox("Snapshot current Org/Role parameters into this invite", value=True)
+        if snapshot and ("org_values" not in st.session_state or "role_weights" not in st.session_state):
+            st.warning("You haven\'t set Org & Role Setup in this session yet — the snapshot will use neutral defaults.")
+        lock_modules = st.checkbox("Lock modules for the candidate (recommended)", value=True, disabled=not snapshot)
+
+        # Module pack (stored in config_json so the candidate gets the right modules)
+        st.write("Modules to include:")
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            m_beh = st.checkbox("Behavioural", value=True, disabled=not snapshot)
+            m_values = st.checkbox("Values", value=True, disabled=not snapshot)
+        with cB:
+            m_ei = st.checkbox("EI SJT", value=True, disabled=not snapshot)
+            m_big5 = st.checkbox("Big Five", value=True, disabled=not snapshot)
+        with cC:
+            m_lead = st.checkbox("Leadership", value=True, disabled=not snapshot)
+            m_types = st.checkbox("Type lens", value=True, disabled=not snapshot)
+        with cD:
+            m_mgmt = st.checkbox("Mgmt prefs", value=True, disabled=not snapshot)
+            m_conf = st.checkbox("Conflict style", value=True, disabled=not snapshot)
+
+        modules = {
+            "behaviour": bool(m_beh),
+            "values": bool(m_values),
+            "ei_sjt": bool(m_ei),
+            "big5": bool(m_big5),
+            "leadership": bool(m_lead),
+            "type_lens": bool(m_types),
+            "mgmt_prefs": bool(m_mgmt),
+            "conflict": bool(m_conf),
+        }
+
+        if snapshot:
+            st.success("This invite will store a snapshot of your Org/Role configuration (weights + values profile + modules).")
+        else:
+            st.warning("No snapshot will be stored. Candidate scoring will use whatever defaults are in the app at the time of completion (not recommended).")
+
     if st.button("Generate token link"):
         try:
-            out = sb_create_invite(role=role.strip() or "Candidate Role", candidate_email=email.strip() or None, expires_days=int(expires_days))
+            cfg = None
+            org_clean = (org or "").strip()
+            role_clean = (role or "").strip() or "Candidate Role"
+            if snapshot:
+                cfg = get_profile_snapshot(
+                    role_label=role_clean,
+                    org_name=org_clean,
+                    modules=modules,
+                    lock_modules=lock_modules,
+                )
+            out = sb_create_invite(
+                role=role_clean,
+                candidate_email=email.strip() or None,
+                expires_days=int(expires_days),
+                org=org_clean or None,
+                config_json=cfg,
+            )
             st.success("Invite created. Copy & email this link:")
             st.code(out["link"])
         except Exception as e:
             st.error(str(e))
-
     st.divider()
+
     st.subheader("Invites")
+    filt = st.selectbox("Filter", ["All", "Active (invited/started)", "Completed", "Revoked/Expired"], index=0)
+
     inv = sb.table("invites").select("*").order("created_at", desc=True).limit(250).execute().data
 
     if not inv:
@@ -2049,30 +2391,61 @@ def page_vervio_dashboard():
         return
 
     for row in inv:
-        cols = st.columns([2, 2, 1, 2])
+        status = (row.get("status") or "").lower()
+
+        if filt == "Active (invited/started)" and status not in ("invited", "started"):
+            continue
+        if filt == "Completed" and status != "completed":
+            continue
+        if filt == "Revoked/Expired" and status not in ("revoked", "expired"):
+            continue
+
+        cols = st.columns([2.2, 1.6, 1.6, 1.0, 1.6, 1.6, 0.9])
         cols[0].write(row.get("candidate_email") or "—")
-        cols[1].write(row.get("role") or "—")
-        cols[2].write(row.get("status") or "—")
-        cols[3].write(row.get("created_at") or "—")
+        cols[1].write(row.get("org") or "—")
+        cols[2].write(row.get("role") or "—")
+        cols[3].write(status or "—")
+        cols[4].write(str(row.get("created_at") or "—"))
+        cols[5].write(str(row.get("expires_at") or "—"))
 
-        if row.get("status") == "completed":
-            res = sb.table("results").select("*").eq("invite_id", row["id"]).order("created_at", desc=True).limit(1).execute().data
-            if res:
-                report = res[0].get("report_json") or {}
-                scores = res[0].get("scores_json") or {}
+        with cols[6]:
+            if status in ("invited", "started"):
+                if st.button("Revoke", key=f"revoke_{row.get('id')}"):
+                    sb_revoke_invite(int(row.get("id")))
+                    st.rerun()
 
-                with st.expander(f"View result (Invite #{row['id']})"):
-                    st.markdown("**Headline scores**")
-                    st.json(scores)
+        if status == "completed":
+                    res = sb.table("results").select("*").eq("invite_id", row["id"]).order("created_at", desc=True).limit(1).execute().data
+                    if res:
+                        report = res[0].get("report_json") or {}
+                        scores = res[0].get("scores_json") or {}
 
-                    st.markdown("**Report summary (stored)**")
-                    st.json({k: report.get(k) for k in ["candidate_name","role","date","behavioral","values","ei","personality","leadership","type_lens","management_prefs","conflict_style","quality"] if k in report})
+                        with st.expander(f"View result (Invite #{row['id']})"):
+                            st.markdown("**Headline scores**")
+                            st.json(scores)
 
-                    try:
-                        pdf_bytes = make_pdf_report(report, report.get("candidate_name",""), report.get("role",""), notes="")
-                        st.download_button("Download PDF summary report", data=pdf_bytes, file_name=f"bea_report_invite_{row['id']}.pdf", mime="application/pdf")
-                    except Exception as e:
-                        st.error(f"PDF export failed: {e}")
+                            st.markdown("**Report summary (stored)**")
+                            st.json({k: report.get(k) for k in ["candidate_name","role","date","behavioral","values","ei","personality","leadership","type_lens","management_prefs","conflict_style","quality"] if k in report})
+
+                            try:
+                                pdf_bytes = make_pdf_report(report, report.get("candidate_name",""), report.get("role",""), notes="")
+                                st.download_button("Download PDF summary report", data=pdf_bytes, file_name=f"bea_report_invite_{row['id']}.pdf", mime="application/pdf")
+                                # Optional: upload PDF to Supabase Storage for retrieval from Supabase
+                                if "SUPABASE_REPORTS_BUCKET" in st.secrets:
+                                    if st.button("Upload PDF to Supabase Storage", key=f"uploadpdf_{row['id']}"):
+                                        path = sb_upload_pdf_to_storage(int(row["id"]), pdf_bytes)
+                                        if path:
+                                            try:
+                                                sb.table("results").update({"pdf_path": path}).eq("id", res[0]["id"]).execute()
+                                            except Exception:
+                                                pass
+                                            st.success(f"Uploaded to storage: {path}")
+                                        else:
+                                            st.warning("Upload failed (check bucket name + Storage enabled).")
+
+                            except Exception as e:
+                                st.error(f"PDF export failed: {e}")
+
 
 
 def page_psychometrics():
@@ -2333,6 +2706,7 @@ def page_research_notes():
         "and consult qualified professionals."
     )
 
+
 def page_candidate_token(token: str):
     st.title(APP_TITLE)
 
@@ -2345,7 +2719,13 @@ def page_candidate_token(token: str):
         st.error("Invalid link (token not found).")
         st.stop()
 
-    # Expiry check
+    # Hard blocks
+    status = (invite.get("status") or "").lower()
+    if status in ("revoked", "expired"):
+        st.error("This link is no longer active.")
+        st.stop()
+
+    # Expiry check (server-side time)
     exp_raw = invite.get("expires_at")
     if exp_raw:
         exp = parse_dt(str(exp_raw))
@@ -2354,23 +2734,38 @@ def page_candidate_token(token: str):
             st.error("This link has expired.")
             st.stop()
 
-    status = (invite.get("status") or "").lower()
     if status == "completed":
         st.info("This assessment link has already been completed.")
         st.stop()
+
+    # Mark started only once (best-effort)
     if status == "invited":
         sb_mark_invite_started(int(invite.get("id")))
+
+    # Apply org/role snapshot (so scoring uses the correct parameters)
+    apply_profile_snapshot(invite.get("config_json") or {})
 
     # Run the normal assessment page in token mode (no sidebar navigation)
     page_assessment(token_mode=True, invite=invite)
 
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
 
-    token = st.query_params.get("token")
+    token = get_query_param("token")
     if token:
         page_candidate_token(str(token))
         return
+
+    # Optional: lock the entire app behind the Vervio password (recommended for pilots)
+    if secret_truthy("LOCK_PUBLIC_APP", False):
+        require_admin()
+        with st.sidebar:
+            st.success("Vervio access unlocked")
+            if st.button("Lock / sign out"):
+                st.session_state.admin_ok = False
+                st.rerun()
 
     st.sidebar.title("Navigation")
     pages = {
@@ -2382,9 +2777,9 @@ def main():
         "Vervio Dashboard": page_vervio_dashboard,
         "Research notes": page_research_notes,
     }
-    choice = st.sidebar.radio("Go to", list(pages.keys()))
-    st.sidebar.caption("Prototype • not a sole hiring gatekeeper")
+    choice = st.sidebar.radio("Go to", list(pages.keys()), index=0)
     pages[choice]()
+
 
 if __name__ == "__main__":
     main()
